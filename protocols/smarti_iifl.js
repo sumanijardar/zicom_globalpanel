@@ -62,61 +62,76 @@ function buildACK(header) {
 }
 
 // Commands mapping based on Smart-i IIFL 32 Zone protocol
+// Commands mapping based on Smart-i IIFL 32 Zone protocol
 const COMMAND_MAP = {
-  'ARM': 'NCG001',          // IIFL System Arm (or NCF001)
-  'DISARM': 'NOG001',       // IIFL System Disarm (or NOF001)
+  'ARM': 'NCG',             // System Arm (NCG + group/zone, default 001)
+  'DISARM': 'NOG',          // System Disarm (NOG + group/zone, default 001)
   'STAY': 'NCP001',         // System Partial Arm
-  
-  // Siren / Hooter Control
-  'SIREN_ON': '[N|002|1]',
-  'SIREN_OFF': '[N|002|0]',
-  'HOOTER_ON': 'NHA001',
-  'HOOTER_OFF': 'NZL001',
-  'HOOTER': '[N|002|1]',
-  
-  // AC / Output Control
-  'AC1_ON': '[N|005|1]',
-  'AC1_OFF': '[N|005|0]',
-  'AC2_ON': '[N|006|1]',
-  'AC2_OFF': '[N|006|0]',
-  
-  // Light Control
-  'LIGHT_ON': '[N|008|1]',
-  'LIGHT_OFF': '[N|008|0]',
-  
-  // Reset and Status Commands
-  'RESET': '[N|000]',
-  'STATUS': 'NYY040',
+
+  // Siren / Hooter / Relay Control (NZH = ON, NZL = OFF)
+  'SIREN_ON': 'NZH',        // Output ON prefix (NZH + zone, e.g. NZH001 or NZH003)
+  'SIREN_OFF': 'NZL',       // Output OFF prefix (NZL + zone, e.g. NZL001 or NZL003)
+  'HOOTER_ON': 'NZH',       // Hooter ON prefix (NZH + zone)
+  'HOOTER_OFF': 'NZL',      // Hooter OFF prefix (NZL + zone, e.g. NZL001)
+  'HOOTER': 'NZH',          // Default Hooter ON
+  'SIREN': 'NZH',           // Default Siren ON
+
+  // Output / Relay Direct Commands
   'RELAY_ON': 'NZH',        // Output ON prefix (NZH + zone)
-  'RELAY_OFF': 'NZL'        // Output OFF prefix (NZL + zone)
+  'RELAY_OFF': 'NZL',       // Output OFF prefix (NZL + zone)
+
+  // AC / Light Control
+  'AC1_ON': 'NZH005',
+  'AC1_OFF': 'NZL005',
+  'AC2_ON': 'NZH006',
+  'AC2_OFF': 'NZL006',
+  'LIGHT_ON': 'NZH008',
+  'LIGHT_OFF': 'NZL008',
+
+  // Reset and Status Commands
+  'RESET': 'NYY000',
+  'STATUS': 'NYY040'
 };
 
 function buildSIACommand(commandType, account, zone = "000", receiver = "R000001", line = "L000000") {
-  const commandPayload = COMMAND_MAP[commandType.toUpperCase()];
-  if (!commandPayload) return null;
+  const upperCmd = commandType.toUpperCase();
+  const cmdBase = COMMAND_MAP[upperCmd];
+  if (!cmdBase) return null;
 
   const seq = String(outSequence++).padStart(4, '0');
   if (outSequence > 9999) outSequence = 1;
   const ts = getTimestamp();
 
-  // Smart-i panels expect a 6-digit account number (e.g., #040205)
+  // Smart-i panels expect a 6-digit account number (e.g., #080600)
   const paddedAccount = String(account).padStart(6, '0');
 
-  let dataWithoutTs;
+  // Format zone to 3 digits (default to 001 if 000 is given for zone-based output commands)
+  const zoneStr = String(zone || "000").trim();
+  const targetZone = (zoneStr !== "000" && zoneStr !== "") ? zoneStr.padStart(3, '0') : "001";
 
-  if (commandPayload.startsWith('[')) {
-    dataWithoutTs = `"SIA-DCS"${seq}${receiver}${line}#${paddedAccount}[#${paddedAccount}|NYY005]${commandPayload}`;
+  let innerCode;
+  if (cmdBase.length === 6) {
+    // Already full 6-character code (e.g., NCP001, NZH005, NYY040)
+    innerCode = cmdBase;
+  } else if (cmdBase.startsWith('[')) {
+    // Extended bracket payload format if ever used
+    const dataWithoutTs = `"SIA-DCS"${seq}${receiver}${line}#${paddedAccount}[#${paddedAccount}|NYY005]${cmdBase}`;
+    const dataWithTs = dataWithoutTs + '_' + ts;
+    const crc = calculateCRC16(dataWithTs);
+    const len = calculateLength(dataWithTs);
+    return `\n${crc}${len}${dataWithTs}\r`;
   } else {
-    const innerCode = commandPayload.length === 6 ? commandPayload : `${commandPayload}${zone}`;
-    dataWithoutTs = `"SIA-DCS"${seq}${receiver}${line}#${paddedAccount}[#${paddedAccount}|${innerCode}]`;
+    // Dynamic command code + 3-digit zone (e.g. NZH + 003 = NZH003, NZL + 003 = NZL003, NCG + 001 = NCG001)
+    innerCode = `${cmdBase}${targetZone}`;
   }
 
+  const dataWithoutTs = `"SIA-DCS"${seq}${receiver}${line}#${paddedAccount}[#${paddedAccount}|${innerCode}]`;
   const dataWithTs = dataWithoutTs + '_' + ts;
   const crc = calculateCRC16(dataWithTs);
   const len = calculateLength(dataWithTs);
   const result = `\n${crc}${len}${dataWithTs}\r`;
 
-  console.log(`\n🛠️  [CONSTRUCTED SMARTI-IIFL SIA COMMAND] Type: ${commandType}, Account: ${paddedAccount}`);
+  console.log(`\n🛠️  [CONSTRUCTED SMARTI-IIFL SIA COMMAND] Type: ${commandType}, Zone: ${targetZone}, InnerCode: ${innerCode}, Account: ${paddedAccount}`);
   return result;
 }
 
@@ -310,7 +325,7 @@ function initiatePanelConnection(panelId, ip) {
 
 async function connectToAllPanels() {
   try {
-    const [rows] = await pool.query("SELECT NewPanelID, dvrip FROM sites WHERE (Panel_Make LIKE '%SMARTI_IIFL%' OR Panel_Make LIKE '%SMART_IIFL%' OR Panel_Make LIKE '%IIFL%') AND dvrip IS NOT NULL AND dvrip != '' ");
+    const [rows] = await pool.query("SELECT NewPanelID, dvrip FROM sites WHERE Panel_Make = 'smarti-iifl' AND dvrip IS NOT NULL AND dvrip != ''; ");
     if (rows && rows.length > 0) {
       console.log(`\n🔄 [SMARTI-IIFL] Found ${rows.length} Smart-i IIFL panels with IPs in database. Initiating outgoing connections...`);
       for (const row of rows) {
@@ -426,5 +441,6 @@ module.exports = {
   checkConnection,
   queueCommand,
   getEvents,
-  getStatus
+  getStatus,
+  buildSIACommand
 };
